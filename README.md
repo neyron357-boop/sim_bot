@@ -13,9 +13,13 @@ Telegram-бот для учета SIM-тарифов сотрудников:
    ```bash
    pip install -r requirements.txt
    ```
-2. Запустите бота:
+2. Создайте `.env` на основе примера и укажите токен:
    ```bash
+   cp .env.example .env
+   # затем отредактируйте .env и задайте BOT_TOKEN
+   ```
+3. Экспортируйте переменные окружения и запустите бота:
+   ```bash
+   export $(grep -v '^#' .env | xargs)
    python bot.py
    ```
-
-> Текущий токен бота указан в `bot.py`.

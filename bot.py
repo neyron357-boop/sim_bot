@@ -4,6 +4,7 @@ from datetime import datetime, time, timedelta
 import os
 import pytz
 import re
+from decimal import Decimal, InvalidOperation
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -18,7 +19,7 @@ from telegram.ext import (
 from telegram.error import NetworkError, TelegramError
 
 # --- НАСТРОЙКИ ---
-BOT_TOKEN = "8285737349:AAFj5pKBjZwHyBX_Ma4viTL7f--OyQsG7KY"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 JSON_FILE = "sim_users.json"
 
 # Настройки времени (Дубай)
@@ -28,6 +29,10 @@ NOTIFICATION_HOUR_DUBAI = 9
 NOTIFICATION_MINUTE_DUBAI = 0
 # Формат даты для ввода и вывода
 DATE_FORMAT = "%d.%m.%Y %H:%M"
+
+PHONE_E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
+MIN_ALLOWED_AMOUNT = Decimal("0.01")
+MAX_ALLOWED_AMOUNT = Decimal("100000")
 # -----------------
 
 # Настройка логирования
@@ -161,10 +166,29 @@ def extract_phone_from_text(text_input: str) -> str:
     if "(" in text_input and ")" in text_input:
         match = re.search(r'\((.*?)\)', text_input)
         if match:
-            return match.group(1).strip().replace(" ", "")
+            return normalize_phone(match.group(1))
 
     # Если это просто номер или текст, возвращаем очищенный текст
-    return text_input.strip().replace(" ", "")
+    return normalize_phone(text_input)
+
+
+def normalize_phone(value: str) -> str:
+    """Нормализует номер телефона: убирает пробелы, дефисы и скобки."""
+    return re.sub(r"[\s\-()]", "", value.strip())
+
+
+def is_valid_phone(phone: str) -> bool:
+    """Проверяет номер телефона в формате E.164."""
+    return bool(PHONE_E164_RE.fullmatch(phone))
+
+
+def parse_amount(value: str) -> Decimal:
+    """Парсит сумму в Decimal и проверяет допустимый диапазон."""
+    normalized = value.strip().replace(",", ".")
+    amount = Decimal(normalized)
+    if amount < MIN_ALLOWED_AMOUNT or amount > MAX_ALLOWED_AMOUNT:
+        raise ValueError("Сумма вне допустимого диапазона")
+    return amount
 
 
 # --- Обработчик ошибок ---
@@ -315,20 +339,22 @@ async def wallet_add_funds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     try:
-        amount = float(text)
+        amount = parse_amount(text)
         data = load_data()
-        data["wallet"] = data.get("wallet", 0.0) + amount
+        current_wallet = Decimal(str(data.get("wallet", 0.0)))
+        new_wallet = current_wallet + amount
+        data["wallet"] = float(new_wallet)
         save_data(data)
 
         await update.message.reply_text(
             f"✅ Баланс пополнен на *{amount} AED*.\n"
-            f"Текущий баланс: *{data['wallet']} AED*",
+            f"Текущий баланс: *{new_wallet} AED*",
             parse_mode="Markdown",
             reply_markup=get_main_keyboard()
         )
-    except ValueError:
+    except (InvalidOperation, ValueError):
         await update.message.reply_text(
-            "⛔️ Ошибка! Введите корректное число.",
+            "⛔️ Ошибка! Введите сумму в диапазоне от 0.01 до 100000 AED.",
             reply_markup=get_main_keyboard()
         )
 
@@ -355,7 +381,14 @@ async def add_get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получает номер и запрашивает тариф."""
-    phone = update.message.text.strip().replace(" ", "")
+    phone = normalize_phone(update.message.text)
+
+    if not is_valid_phone(phone):
+        await update.message.reply_text(
+            "⛔️ Неверный номер. Используйте международный формат E.164: *+971XXXXXXXXX*.",
+            parse_mode="Markdown"
+        )
+        return ADD_PHONE
 
     data = load_data()
     users = data.get("users", {})
@@ -418,12 +451,12 @@ async def add_tariff_new_name(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def add_tariff_new_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        cost = float(update.message.text.strip())
+        cost = parse_amount(update.message.text)
         name = context.user_data['new_tariff_name']
 
         # Сохраняем тариф в базу сразу
         data = load_data()
-        data["tariffs"][name] = cost
+        data["tariffs"][name] = float(cost)
         save_data(data)
 
         context.user_data['tariff_name'] = name
@@ -433,8 +466,11 @@ async def add_tariff_new_cost(update: Update, context: ContextTypes.DEFAULT_TYPE
         await request_connection_date(update)
         return ADD_CONNECTION_DATETIME
 
-    except ValueError:
-        await update.message.reply_text("⛔️ Введите корректное число.", parse_mode="Markdown")
+    except (InvalidOperation, ValueError):
+        await update.message.reply_text(
+            "⛔️ Введите сумму тарифа в диапазоне от 0.01 до 100000 AED.",
+            parse_mode="Markdown"
+        )
         return ADD_TARIFF_NEW_COST
 
 
@@ -483,17 +519,29 @@ async def save_connection_datetime(update: Update, context: ContextTypes.DEFAULT
     mode = context.user_data.get('mode', 'add')
 
     tariff_name = context.user_data.get('tariff_name')
-    tariff_cost = context.user_data.get('tariff_cost', 0.0)
+    tariff_cost = Decimal(str(context.user_data.get('tariff_cost', 0.0)))
 
     data = load_data()
     users = data.get("users", {})
-    wallet = data.get("wallet", 0.0)
+    wallet = Decimal(str(data.get("wallet", 0.0)))
 
     # Логика списания только при добавлении
     wallet_msg = ""
     if mode == 'add':
+        if wallet < tariff_cost:
+            await update.message.reply_text(
+                f"⛔️ Недостаточно средств в кошельке.\n"
+                f"Нужно: *{tariff_cost} AED*\n"
+                f"Доступно: *{wallet} AED*\n\n"
+                f"Пополните кошелек и повторите добавление.",
+                parse_mode="Markdown",
+                reply_markup=get_main_keyboard()
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
         wallet -= tariff_cost
-        data["wallet"] = wallet
+        data["wallet"] = float(wallet)
         wallet_msg = f"\n💸 Списано: *{tariff_cost} AED*\n💰 Остаток: *{wallet} AED*"
 
         # Создаем запись
@@ -502,7 +550,7 @@ async def save_connection_datetime(update: Update, context: ContextTypes.DEFAULT
             "connection_datetime": connection_dt_str,
             "expiry_datetime": expiry_dt_str,
             "tariff_name": tariff_name,
-            "tariff_cost": tariff_cost
+            "tariff_cost": float(tariff_cost)
         }
     else:
         # Редактирование (только даты пока)
@@ -741,6 +789,9 @@ async def check_expirations(context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Запускает бота."""
+
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN не найден. Укажите токен в переменной окружения BOT_TOKEN.")
 
     persistence = PicklePersistence(filepath="bot_persistence")
 
