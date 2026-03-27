@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sqlite3
+from io import BytesIO
 from contextlib import closing
 from datetime import datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
@@ -59,7 +60,7 @@ logger = logging.getLogger(__name__)
 ) = range(7)
 (DELETE_PHONE,) = range(7, 8)
 (EDIT_SELECT_USER, EDIT_CONNECTION_DATETIME) = range(8, 10)
-(WALLET_MENU, WALLET_ADD_FUNDS) = range(10, 12)
+(WALLET_MENU, WALLET_ADD_FUNDS, WALLET_EXPENSE) = range(10, 13)
 
 
 # --- БАЗА ДАННЫХ ---
@@ -218,7 +219,7 @@ def log_audit(
 
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
-        [["➕ Добавить", "📋 Список"], ["💰 Кошелек", "✏️ Редактировать"], ["🗑️ Удалить"]],
+        [["➕ Добавить", "📋 Список"], ["💰 Кошелек", "📥 Отчет"], ["✏️ Редактировать", "🗑️ Удалить"]],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
@@ -273,6 +274,89 @@ def format_timedelta(td: timedelta) -> str:
     if minutes:
         parts.append(f"{minutes} мин.")
     return " ".join(parts)
+
+
+def fetch_recent_wallet_ops(conn: sqlite3.Connection, limit: int = 3) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, amount_cents, type, description, actor_chat_id, created_at
+        FROM wallet_ledger
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def wallet_operation_title(op_type: str, amount_cents: int) -> str:
+    mapping = {
+        "topup": "Пополнение",
+        "migration_topup": "Миграция",
+        "charge": "Списание тарифа",
+        "expense": "Бытовой расход",
+    }
+    sign = "+" if amount_cents >= 0 else "-"
+    return f"{mapping.get(op_type, op_type)} {sign}{format_amount(abs(amount_cents))} AED"
+
+
+def format_recent_wallet_ops(ops: list[sqlite3.Row]) -> str:
+    if not ops:
+        return "Операций пока нет."
+
+    lines = []
+    for idx, row in enumerate(ops, start=1):
+        lines.append(
+            f"{idx}. {wallet_operation_title(row['type'], row['amount_cents'])}\n"
+            f"   ├─ Дата: {row['created_at']}\n"
+            f"   └─ Описание: {row['description'] or '—'}"
+        )
+    return "\n".join(lines)
+
+
+async def send_wallet_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        return
+
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, amount_cents, type, description, actor_chat_id, created_at
+            FROM wallet_ledger
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        final_balance = get_wallet_balance_cents(conn)
+
+    if not rows:
+        await update.message.reply_text("Операций для отчета пока нет.", reply_markup=get_main_keyboard())
+        return
+
+    report = BytesIO()
+    header = "№;Дата;Тип;Описание;Сумма(AED);Баланс после операции(AED)\n"
+    report.write(header.encode("utf-8"))
+    running_balance = 0
+    for index, row in enumerate(rows, start=1):
+        running_balance += int(row["amount_cents"])
+        line = (
+            f"{index};{row['created_at']};{row['type']};{row['description'] or ''};"
+            f"{format_amount(row['amount_cents'])};{format_amount(running_balance)}\n"
+        )
+        report.write(line.encode("utf-8"))
+
+    report_name = f"wallet_report_{datetime.now(DUBAI_TZ).strftime('%Y%m%d_%H%M')}.csv"
+    report.name = report_name
+    report.seek(0)
+
+    await update.message.reply_document(
+        document=report,
+        filename=report_name,
+        caption=(
+            "📥 Отчет по операциям сформирован.\n"
+            f"Всего операций: {len(rows)}\n"
+            f"Итоговый баланс: {format_amount(final_balance)} AED"
+        ),
+        reply_markup=get_main_keyboard(),
+    )
 
 
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -338,6 +422,7 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with closing(get_conn()) as conn:
         users = conn.execute("SELECT * FROM users ORDER BY expiry_datetime").fetchall()
         wallet_cents = get_wallet_balance_cents(conn)
+        recent_ops = fetch_recent_wallet_ops(conn, limit=3)
 
     if not users:
         await update.message.reply_text(
@@ -348,7 +433,12 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     now_dubai = datetime.now(DUBAI_TZ)
-    message = f"💰 Баланс: *{format_amount(wallet_cents)} AED*\n📄 *Список сотрудников и дат:*\n\n"
+    message = (
+        f"💰 Баланс: *{format_amount(wallet_cents)} AED*\n"
+        "🧾 *Последние 3 операции:*\n"
+        f"{format_recent_wallet_ops(recent_ops)}\n\n"
+        "📄 *Список сотрудников:*\n\n"
+    )
 
     for row in users:
         expiry_dt_obj = DUBAI_TZ.localize(datetime.strptime(row["expiry_datetime"], DATE_FORMAT))
@@ -367,13 +457,15 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             remaining = format_timedelta(time_left)
 
         message += (
-            f"👤 *{row['name']}* ({row['phone']})\n"
-            f"   ├─ Тариф: {row['tariff_name'] or 'Не указан'} ({row['tariff_duration_days']} дн.)\n"
-            f"   ├─ Подключен: {row['connection_datetime']}\n"
-            f"   └─ До: *{row['expiry_datetime']}* {status_icon}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 *{row['name']}*\n"
+            f"📞 {row['phone']}\n"
+            f"🏷 Тариф: {row['tariff_name'] or 'Не указан'} ({row['tariff_duration_days']} дн.)\n"
+            f"🗓 Подключен: {row['connection_datetime']}\n"
+            f"⏳ До: *{row['expiry_datetime']}* {status_icon}\n"
         )
         if remaining:
-            message += f"   └─ Осталось: {remaining}\n"
+            message += f"⌛ Осталось: {remaining}\n"
 
     await update.message.reply_text(message, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
@@ -385,10 +477,15 @@ async def wallet_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     with closing(get_conn()) as conn:
         wallet_cents = get_wallet_balance_cents(conn)
+        recent_ops = fetch_recent_wallet_ops(conn, limit=3)
 
-    markup = ReplyKeyboardMarkup([["➕ Пополнить"], ["🔙 Назад"]], resize_keyboard=True, one_time_keyboard=True)
+    markup = ReplyKeyboardMarkup([["➕ Пополнить", "➖ Расход"], ["📥 Скачать отчет"], ["🔙 Назад"]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(
-        f"💰 *Кошелек*\nТекущий баланс: *{format_amount(wallet_cents)} AED*\n\nВыберите действие:",
+        "💰 *Кошелек*\n"
+        f"Текущий баланс: *{format_amount(wallet_cents)} AED*\n\n"
+        "🧾 *Последние 3 операции:*\n"
+        f"{format_recent_wallet_ops(recent_ops)}\n\n"
+        "Выберите действие:",
         parse_mode="Markdown",
         reply_markup=markup,
     )
@@ -399,9 +496,19 @@ async def wallet_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.message.text == "🔙 Назад":
         await update.message.reply_text("Главное меню", reply_markup=get_main_keyboard())
         return ConversationHandler.END
+    if update.message.text == "📥 Скачать отчет":
+        await send_wallet_report(update, context)
+        return ConversationHandler.END
     if update.message.text == "➕ Пополнить":
         await update.message.reply_text("Введите сумму пополнения (в AED):", reply_markup=ReplyKeyboardRemove())
         return WALLET_ADD_FUNDS
+    if update.message.text == "➖ Расход":
+        await update.message.reply_text(
+            "Введите бытовой расход в формате:\n`сумма; описание`\nНапример: `25.5; Такси`",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return WALLET_EXPENSE
     await update.message.reply_text("Неизвестная команда.", reply_markup=get_main_keyboard())
     return ConversationHandler.END
 
@@ -410,6 +517,7 @@ async def wallet_add_funds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cents = parse_amount_to_cents(update.message.text)
         with closing(get_conn()) as conn:
+            balance_before = get_wallet_balance_cents(conn)
             conn.execute(
                 "INSERT INTO wallet_ledger(amount_cents, type, description, actor_chat_id, created_at) VALUES (?, ?, ?, ?, ?)",
                 (cents, "topup", "manual topup", update.effective_chat.id, datetime.now(DUBAI_TZ).strftime(DATE_FORMAT)),
@@ -419,7 +527,10 @@ async def wallet_add_funds(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
 
         await update.message.reply_text(
-            f"✅ Баланс пополнен на *{format_amount(cents)} AED*.\nТекущий баланс: *{format_amount(balance)} AED*",
+            f"✅ Баланс пополнен.\n"
+            f"💼 Баланс до: *{format_amount(balance_before)} AED*\n"
+            f"➕ Операция: *+{format_amount(cents)} AED*\n"
+            f"💰 Баланс после: *{format_amount(balance)} AED*",
             parse_mode="Markdown",
             reply_markup=get_main_keyboard(),
         )
@@ -428,6 +539,60 @@ async def wallet_add_funds(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⛔️ Ошибка! Введите сумму в диапазоне от 0.01 до 100000 AED.",
             reply_markup=get_main_keyboard(),
         )
+    return ConversationHandler.END
+
+
+async def wallet_add_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        raw = update.message.text.strip()
+        parts = [p.strip() for p in raw.split(";", 1)]
+        if len(parts) != 2 or not parts[1]:
+            raise ValueError("Некорректный формат")
+
+        expense_cents = parse_amount_to_cents(parts[0])
+        description = parts[1]
+
+        with closing(get_conn()) as conn:
+            balance_before = get_wallet_balance_cents(conn)
+            if balance_before < expense_cents:
+                await update.message.reply_text(
+                    f"⛔️ Недостаточно средств.\n"
+                    f"💼 Баланс до: *{format_amount(balance_before)} AED*\n"
+                    f"➖ Расход: *{format_amount(expense_cents)} AED*",
+                    parse_mode="Markdown",
+                    reply_markup=get_main_keyboard(),
+                )
+                return ConversationHandler.END
+
+            conn.execute(
+                "INSERT INTO wallet_ledger(amount_cents, type, description, actor_chat_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                (-expense_cents, "expense", description, update.effective_chat.id, datetime.now(DUBAI_TZ).strftime(DATE_FORMAT)),
+            )
+            balance_after = get_wallet_balance_cents(conn)
+            log_audit(
+                conn,
+                "wallet_expense",
+                None,
+                f"-{format_amount(expense_cents)} AED; {description}",
+                update.effective_chat.id,
+            )
+            conn.commit()
+
+        await update.message.reply_text(
+            f"✅ Бытовой расход учтен.\n"
+            f"💼 Баланс до: *{format_amount(balance_before)} AED*\n"
+            f"➖ Операция: *-{format_amount(expense_cents)} AED* ({description})\n"
+            f"💰 Баланс после: *{format_amount(balance_after)} AED*",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(),
+        )
+    except (InvalidOperation, ValueError):
+        await update.message.reply_text(
+            "⛔️ Неверный формат. Используйте: `сумма; описание`.\nНапример: `25.5; Такси`",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(),
+        )
+
     return ConversationHandler.END
 
 
@@ -630,7 +795,9 @@ async def save_connection_datetime(update: Update, context: ContextTypes.DEFAULT
 
             await update.message.reply_text(
                 f"✅ *Тариф подключен:*\nИмя: {name}\nТариф: {tariff_name}\nПодключен: {connection_dt_str}\nИстекает: *{expiry_dt_str}*\n"
-                f"💸 Списано: *{format_amount(cost_cents)} AED*\n💰 Остаток: *{format_amount(new_balance)} AED*",
+                f"💼 Баланс до: *{format_amount(wallet_cents)} AED*\n"
+                f"💸 Списание: *-{format_amount(cost_cents)} AED*\n"
+                f"💰 Баланс после: *{format_amount(new_balance)} AED*",
                 parse_mode="Markdown",
                 reply_markup=get_main_keyboard(),
             )
@@ -864,6 +1031,7 @@ def main():
         states={
             WALLET_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, wallet_menu_handler)],
             WALLET_ADD_FUNDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, wallet_add_funds)],
+            WALLET_EXPENSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, wallet_add_expense)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         persistent=True,
@@ -872,7 +1040,9 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_users))
+    app.add_handler(CommandHandler("report", send_wallet_report))
     app.add_handler(MessageHandler(filters.Regex(r"^📋 Список$") & ~filters.COMMAND, list_users))
+    app.add_handler(MessageHandler(filters.Regex(r"^📥 Отчет$") & ~filters.COMMAND, send_wallet_report))
 
     app.add_handler(add_conv_handler)
     app.add_handler(delete_conv_handler)
