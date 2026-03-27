@@ -11,7 +11,7 @@ from typing import Optional
 
 import pytz
 from openpyxl import Workbook
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import Document, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.error import NetworkError, TelegramError
 from telegram.ext import (
     Application,
@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 (DELETE_PHONE,) = range(7, 8)
 (EDIT_SELECT_USER, EDIT_CONNECTION_DATETIME) = range(8, 10)
 (WALLET_MENU, WALLET_ADD_FUNDS, WALLET_EXPENSE) = range(10, 13)
+(IMPORT_WAIT_FILE,) = range(13, 14)
 
 
 # --- БАЗА ДАННЫХ ---
@@ -219,7 +220,12 @@ def log_audit(
 
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
-        [["➕ Добавить", "📋 Список"], ["💰 Кошелек", "📥 Отчет"], ["✏️ Редактировать", "🗑️ Удалить"]],
+        [
+            ["➕ Добавить", "📋 Список"],
+            ["💰 Кошелек", "📥 Отчет"],
+            ["📤 Экспорт", "📥 Импорт"],
+            ["✏️ Редактировать", "🗑️ Удалить"],
+        ],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
@@ -442,16 +448,18 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     now_dubai = datetime.now(DUBAI_TZ)
-    message = (
-        f"💰 Баланс: *{format_amount(wallet_cents)} AED*\n"
-        "🧾 *Последние 3 операции:*\n"
-        f"{format_recent_wallet_ops(recent_ops)}\n\n"
-        "📄 *Список сотрудников:*\n\n"
-    )
+    expiring_soon = []
+    regular = []
 
     for row in users:
         expiry_dt_obj = DUBAI_TZ.localize(datetime.strptime(row["expiry_datetime"], DATE_FORMAT))
         time_left = expiry_dt_obj - now_dubai
+        if time_left <= timedelta(days=3):
+            expiring_soon.append((row, expiry_dt_obj, time_left))
+        else:
+            regular.append((row, expiry_dt_obj, time_left))
+
+    def render_user_block(row: sqlite3.Row, expiry_dt_obj: datetime, time_left: timedelta) -> str:
         if time_left.total_seconds() <= 0:
             status_icon = f"❗️ (Просрочено: {format_timedelta(now_dubai - expiry_dt_obj)})"
             remaining = ""
@@ -465,7 +473,7 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_icon = "✅"
             remaining = format_timedelta(time_left)
 
-        message += (
+        block = (
             "━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 *{row['name']}*\n"
             f"📞 {row['phone']}\n"
@@ -474,9 +482,194 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ До: *{row['expiry_datetime']}* {status_icon}\n"
         )
         if remaining:
-            message += f"⌛ Осталось: {remaining}\n"
+            block += f"⌛ Осталось: {remaining}\n"
+        return block
+
+    message = (
+        f"💰 Баланс: *{format_amount(wallet_cents)} AED*\n"
+        "🧾 *Последние 3 операции:*\n"
+        f"{format_recent_wallet_ops(recent_ops)}\n\n"
+        "📄 *Список сотрудников:*\n\n"
+    )
+
+    message += f"🔴 *До окончания меньше 3 дней*: {len(expiring_soon)}\n\n"
+    if expiring_soon:
+        for row, expiry_dt_obj, time_left in expiring_soon:
+            message += render_user_block(row, expiry_dt_obj, time_left)
+    else:
+        message += "Нет сотрудников в этой категории.\n"
+
+    message += f"\n🟢 *Остальные*: {len(regular)}\n\n"
+    if regular:
+        for row, expiry_dt_obj, time_left in regular:
+            message += render_user_block(row, expiry_dt_obj, time_left)
+    else:
+        message += "Нет сотрудников в этой категории.\n"
 
     await update.message.reply_text(message, parse_mode="Markdown", reply_markup=get_main_keyboard())
+
+
+def dump_database_payload(conn: sqlite3.Connection) -> dict:
+    def fetch_table(name: str) -> list[dict]:
+        rows = conn.execute(f"SELECT * FROM {name}").fetchall()
+        return [dict(row) for row in rows]
+
+    return {
+        "exported_at": datetime.now(DUBAI_TZ).strftime(DATE_FORMAT),
+        "version": 1,
+        "settings": fetch_table("settings"),
+        "tariffs": fetch_table("tariffs"),
+        "users": fetch_table("users"),
+        "wallet_ledger": fetch_table("wallet_ledger"),
+        "audit_log": fetch_table("audit_log"),
+    }
+
+
+def restore_database_payload(conn: sqlite3.Connection, payload: dict) -> None:
+    required = {"settings", "tariffs", "users", "wallet_ledger", "audit_log"}
+    missing = required.difference(payload.keys())
+    if missing:
+        raise ValueError(f"В файле не хватает разделов: {', '.join(sorted(missing))}")
+
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DELETE FROM settings")
+        conn.execute("DELETE FROM tariffs")
+        conn.execute("DELETE FROM users")
+        conn.execute("DELETE FROM wallet_ledger")
+        conn.execute("DELETE FROM audit_log")
+
+        for row in payload["settings"]:
+            conn.execute("INSERT INTO settings(key, value) VALUES (?, ?)", (row["key"], row["value"]))
+
+        for row in payload["tariffs"]:
+            conn.execute(
+                "INSERT INTO tariffs(name, cost_cents, duration_days, created_at) VALUES (?, ?, ?, ?)",
+                (row["name"], row["cost_cents"], row["duration_days"], row["created_at"]),
+            )
+
+        for row in payload["users"]:
+            conn.execute(
+                """
+                INSERT INTO users(
+                    phone, name, connection_datetime, expiry_datetime,
+                    tariff_name, tariff_cost_cents, tariff_duration_days,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["phone"],
+                    row["name"],
+                    row["connection_datetime"],
+                    row["expiry_datetime"],
+                    row.get("tariff_name"),
+                    row["tariff_cost_cents"],
+                    row["tariff_duration_days"],
+                    row["created_at"],
+                    row["updated_at"],
+                ),
+            )
+
+        for row in payload["wallet_ledger"]:
+            conn.execute(
+                """
+                INSERT INTO wallet_ledger(
+                    id, amount_cents, type, description, actor_chat_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["amount_cents"],
+                    row["type"],
+                    row.get("description"),
+                    row.get("actor_chat_id"),
+                    row["created_at"],
+                ),
+            )
+
+        for row in payload["audit_log"]:
+            conn.execute(
+                """
+                INSERT INTO audit_log(
+                    id, action, phone, details, actor_chat_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["action"],
+                    row.get("phone"),
+                    row.get("details"),
+                    row.get("actor_chat_id"),
+                    row["created_at"],
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        return
+
+    with closing(get_conn()) as conn:
+        payload = dump_database_payload(conn)
+
+    report = BytesIO(json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
+    report_name = f"sim_bot_backup_{datetime.now(DUBAI_TZ).strftime('%Y%m%d_%H%M')}.json"
+    report.name = report_name
+    report.seek(0)
+
+    await update.message.reply_document(
+        document=report,
+        filename=report_name,
+        caption="📤 Резервная копия базы данных сформирована.",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+async def import_data_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Отправьте JSON-файл, который был создан через *Экспорт*. Текущие данные будут полностью заменены.",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup([["/cancel"]], resize_keyboard=True, one_time_keyboard=True),
+    )
+    return IMPORT_WAIT_FILE
+
+
+async def import_data_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc: Optional[Document] = update.message.document
+    if not doc or not doc.file_name.lower().endswith(".json"):
+        await update.message.reply_text("⛔️ Нужен JSON-файл с резервной копией.")
+        return IMPORT_WAIT_FILE
+
+    tg_file = await doc.get_file()
+    raw = await tg_file.download_as_bytearray()
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        await update.message.reply_text("⛔️ Не удалось прочитать JSON. Проверьте файл.")
+        return IMPORT_WAIT_FILE
+
+    try:
+        with closing(get_conn()) as conn:
+            restore_database_payload(conn, payload)
+            log_audit(conn, "data_import", None, f"import file: {doc.file_name}", update.effective_chat.id)
+            conn.commit()
+    except Exception as exc:
+        await update.message.reply_text(f"⛔️ Импорт не выполнен: {exc}", reply_markup=get_main_keyboard())
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "✅ Импорт завершен. Данные восстановлены из резервной копии.",
+        reply_markup=get_main_keyboard(),
+    )
+    return ConversationHandler.END
 
 
 # --- КОШЕЛЕК ---
@@ -1029,16 +1222,32 @@ def main():
         name="wallet_conversation",
     )
 
+    import_conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("import_data", import_data_start),
+            MessageHandler(filters.Regex(r"^📥 Импорт$") & ~filters.COMMAND, import_data_start),
+        ],
+        states={
+            IMPORT_WAIT_FILE: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, import_data_apply)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        persistent=True,
+        name="import_conversation",
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_users))
     app.add_handler(CommandHandler("report", send_wallet_report))
+    app.add_handler(CommandHandler("export_data", export_data))
     app.add_handler(MessageHandler(filters.Regex(r"^📋 Список$") & ~filters.COMMAND, list_users))
     app.add_handler(MessageHandler(filters.Regex(r"^📥 Отчет$") & ~filters.COMMAND, send_wallet_report))
+    app.add_handler(MessageHandler(filters.Regex(r"^📤 Экспорт$") & ~filters.COMMAND, export_data))
 
     app.add_handler(add_conv_handler)
     app.add_handler(delete_conv_handler)
     app.add_handler(edit_conv_handler)
     app.add_handler(wallet_conv_handler)
+    app.add_handler(import_conv_handler)
 
     app.add_error_handler(error_handler)
 
