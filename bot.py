@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 import pytz
+from openpyxl import Workbook
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.error import NetworkError, TelegramError
 from telegram.ext import (
@@ -32,7 +33,6 @@ NOTIFICATION_HOUR_DUBAI = 9
 NOTIFICATION_MINUTE_DUBAI = 0
 DATE_FORMAT = "%d.%m.%Y %H:%M"
 
-PHONE_E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 MIN_ALLOWED_AMOUNT = Decimal("0.01")
 MAX_ALLOWED_AMOUNT = Decimal("100000")
 
@@ -230,7 +230,7 @@ def get_today_date_keyboard():
 
 
 def normalize_phone(value: str) -> str:
-    return re.sub(r"[\s\-()]", "", value.strip())
+    return value.strip()
 
 
 def extract_phone_from_text(text_input: str) -> str:
@@ -242,7 +242,7 @@ def extract_phone_from_text(text_input: str) -> str:
 
 
 def is_valid_phone(phone: str) -> bool:
-    return bool(PHONE_E164_RE.fullmatch(phone))
+    return bool(phone.strip())
 
 
 def parse_amount_to_cents(value: str) -> int:
@@ -331,19 +331,28 @@ async def send_wallet_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("Операций для отчета пока нет.", reply_markup=get_main_keyboard())
         return
 
-    report = BytesIO()
-    header = "№;Дата;Тип;Описание;Сумма(AED);Баланс после операции(AED)\n"
-    report.write(header.encode("utf-8"))
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Wallet report"
+    ws.append(["№", "Дата", "Тип", "Описание", "Сумма (AED)", "Баланс после операции (AED)"])
+
     running_balance = 0
     for index, row in enumerate(rows, start=1):
         running_balance += int(row["amount_cents"])
-        line = (
-            f"{index};{row['created_at']};{row['type']};{row['description'] or ''};"
-            f"{format_amount(row['amount_cents'])};{format_amount(running_balance)}\n"
+        ws.append(
+            [
+                index,
+                row["created_at"],
+                row["type"],
+                row["description"] or "",
+                float(cents_to_decimal(row["amount_cents"])),
+                float(cents_to_decimal(running_balance)),
+            ]
         )
-        report.write(line.encode("utf-8"))
 
-    report_name = f"wallet_report_{datetime.now(DUBAI_TZ).strftime('%Y%m%d_%H%M')}.csv"
+    report = BytesIO()
+    wb.save(report)
+    report_name = f"wallet_report_{datetime.now(DUBAI_TZ).strftime('%Y%m%d_%H%M')}.xlsx"
     report.name = report_name
     report.seek(0)
 
@@ -554,15 +563,6 @@ async def wallet_add_expense(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         with closing(get_conn()) as conn:
             balance_before = get_wallet_balance_cents(conn)
-            if balance_before < expense_cents:
-                await update.message.reply_text(
-                    f"⛔️ Недостаточно средств.\n"
-                    f"💼 Баланс до: *{format_amount(balance_before)} AED*\n"
-                    f"➖ Расход: *{format_amount(expense_cents)} AED*",
-                    parse_mode="Markdown",
-                    reply_markup=get_main_keyboard(),
-                )
-                return ConversationHandler.END
 
             conn.execute(
                 "INSERT INTO wallet_ledger(amount_cents, type, description, actor_chat_id, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -579,7 +579,7 @@ async def wallet_add_expense(update: Update, context: ContextTypes.DEFAULT_TYPE)
             conn.commit()
 
         await update.message.reply_text(
-            f"✅ Бытовой расход учтен.\n"
+            f"✅ Бытовой расход учтен{' (долг)' if balance_after < 0 else ''}.\n"
             f"💼 Баланс до: *{format_amount(balance_before)} AED*\n"
             f"➖ Операция: *-{format_amount(expense_cents)} AED* ({description})\n"
             f"💰 Баланс после: *{format_amount(balance_after)} AED*",
@@ -608,14 +608,14 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["name"] = update.message.text.strip()
-    await update.message.reply_text("Введите *номер телефона* в формате +971...:", parse_mode="Markdown")
+    await update.message.reply_text("Введите *номер телефона* (в любом формате):", parse_mode="Markdown")
     return ADD_PHONE
 
 
 async def add_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = normalize_phone(update.message.text)
     if not is_valid_phone(phone):
-        await update.message.reply_text("⛔️ Неверный формат E.164: *+971XXXXXXXXX*", parse_mode="Markdown")
+        await update.message.reply_text("⛔️ Номер телефона не должен быть пустым.", parse_mode="Markdown")
         return ADD_PHONE
 
     with closing(get_conn()) as conn:
@@ -750,15 +750,6 @@ async def save_connection_datetime(update: Update, context: ContextTypes.DEFAULT
             cost_cents = int(context.user_data.get("tariff_cost_cents", 0))
             wallet_cents = get_wallet_balance_cents(conn)
 
-            if wallet_cents < cost_cents:
-                await update.message.reply_text(
-                    f"⛔️ Недостаточно средств. Нужно: *{format_amount(cost_cents)} AED*, доступно: *{format_amount(wallet_cents)} AED*.",
-                    parse_mode="Markdown",
-                    reply_markup=get_main_keyboard(),
-                )
-                context.user_data.clear()
-                return ConversationHandler.END
-
             conn.execute(
                 "INSERT INTO wallet_ledger(amount_cents, type, description, actor_chat_id, created_at) VALUES (?, ?, ?, ?, ?)",
                 (-cost_cents, "charge", f"tariff charge {phone}", update.effective_chat.id, datetime.now(DUBAI_TZ).strftime(DATE_FORMAT)),
@@ -794,7 +785,7 @@ async def save_connection_datetime(update: Update, context: ContextTypes.DEFAULT
             conn.commit()
 
             await update.message.reply_text(
-                f"✅ *Тариф подключен:*\nИмя: {name}\nТариф: {tariff_name}\nПодключен: {connection_dt_str}\nИстекает: *{expiry_dt_str}*\n"
+                f"✅ *Тариф подключен{' (долг)' if new_balance < 0 else ''}:*\nИмя: {name}\nТариф: {tariff_name}\nПодключен: {connection_dt_str}\nИстекает: *{expiry_dt_str}*\n"
                 f"💼 Баланс до: *{format_amount(wallet_cents)} AED*\n"
                 f"💸 Списание: *-{format_amount(cost_cents)} AED*\n"
                 f"💰 Баланс после: *{format_amount(new_balance)} AED*",
