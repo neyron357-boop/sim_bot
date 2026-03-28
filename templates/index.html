@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SIM Bot — Web</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background: #f5f7fb; color: #111; }
+    h1, h2 { margin-top: 0; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .card { background: white; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.08); padding: 16px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; border-bottom: 1px solid #e5e7eb; padding: 8px 6px; font-size: 14px; }
+    input, select, button { width: 100%; margin: 6px 0 10px; padding: 10px; border: 1px solid #d1d5db; border-radius: 8px; }
+    button { background: #2563eb; border: none; color: white; cursor: pointer; }
+    button.delete { background: #dc2626; }
+    .badge { padding: 2px 8px; border-radius: 99px; font-size: 12px; color: white; }
+    .ok { background: #16a34a; }
+    .warning { background: #d97706; }
+    .expired { background: #dc2626; }
+    .flash { padding: 10px; border-radius: 8px; margin-bottom: 10px; }
+    .flash.success { background: #dcfce7; }
+    .flash.error { background: #fee2e2; }
+    .wallet { font-size: 28px; font-weight: bold; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <h1>SIM Bot — веб-панель</h1>
+  <p>Эта панель работает с той же SQLite-базой, что и Telegram-бот (синхронизация в реальном времени через общую БД).</p>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+      <div class="flash {{ category }}">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+
+  <div class="grid">
+    <section class="card">
+      <h2>Кошелек</h2>
+      <div class="wallet">{{ format_amount(wallet_cents) }} AED</div>
+
+      <form method="post" action="{{ url_for('wallet_topup') }}">
+        <label>Пополнение (AED)</label>
+        <input name="amount" placeholder="Например: 100" required />
+        <button type="submit">Пополнить</button>
+      </form>
+
+      <h3>Последние операции</h3>
+      <table>
+        <thead><tr><th>Дата</th><th>Тип</th><th>Описание</th><th>Сумма</th></tr></thead>
+        <tbody>
+          {% for op in recent_wallet_ops %}
+            <tr>
+              <td class="mono">{{ op['created_at'] }}</td>
+              <td>{{ op['type'] }}</td>
+              <td>{{ op['description'] or '—' }}</td>
+              <td>{{ format_amount(op['amount_cents']) }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="4">Нет операций.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Добавить сотрудника</h2>
+      <form method="post" action="{{ url_for('add_user') }}">
+        <label>Имя</label>
+        <input name="name" required />
+
+        <label>Телефон</label>
+        <input name="phone" required />
+
+        <label>Тариф</label>
+        <select name="tariff_name" required>
+          <option value="">-- Выберите тариф --</option>
+          {% for tariff in tariffs %}
+            <option value="{{ tariff['name'] }}">{{ tariff['name'] }} ({{ format_amount(tariff['cost_cents']) }} AED / {{ tariff['duration_days'] }} дн.)</option>
+          {% endfor %}
+        </select>
+
+        <label>Дата подключения (ДД.ММ.ГГГГ ЧЧ:ММ, можно пусто = сейчас)</label>
+        <input name="connection_datetime" placeholder="28.03.2026 09:00" />
+
+        <button type="submit">Добавить и списать тариф</button>
+      </form>
+    </section>
+  </div>
+
+  <section class="card" style="margin-top: 20px;">
+    <h2>Сотрудники</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Имя</th>
+          <th>Телефон</th>
+          <th>Тариф</th>
+          <th>Подключен</th>
+          <th>Истекает</th>
+          <th>Статус</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for user in users %}
+        <tr>
+          <td>{{ user.name }}</td>
+          <td class="mono">{{ user.phone }}</td>
+          <td>{{ user.tariff_name }} ({{ user.tariff_duration_days }} дн.)</td>
+          <td class="mono">{{ user.connection_datetime }}</td>
+          <td class="mono">{{ user.expiry_datetime }}</td>
+          <td><span class="badge {{ user.status }}">{{ user.status }}</span></td>
+          <td>
+            <form method="post" action="{{ url_for('delete_user', phone=user.phone) }}" onsubmit="return confirm('Удалить пользователя?')">
+              <button class="delete" type="submit">Удалить</button>
+            </form>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7">Пользователей пока нет.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</body>
+</html>
