@@ -247,6 +247,16 @@ def extract_phone_from_text(text_input: str) -> str:
     return normalize_phone(text_input)
 
 
+def extract_phone_from_description(description: Optional[str]) -> Optional[str]:
+    if not description:
+        return None
+    match = re.search(r"tariff charge\s+(.+)$", description.strip())
+    if not match:
+        return None
+    phone = normalize_phone(match.group(1))
+    return phone if phone else None
+
+
 def is_valid_phone(phone: str) -> bool:
     return bool(phone.strip())
 
@@ -331,6 +341,10 @@ async def send_wallet_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ORDER BY id ASC
             """
         ).fetchall()
+        users_by_phone = {
+            row["phone"]: row["name"]
+            for row in conn.execute("SELECT phone, name FROM users").fetchall()
+        }
         final_balance = get_wallet_balance_cents(conn)
 
     if not rows:
@@ -340,16 +354,31 @@ async def send_wallet_report(update: Update, context: ContextTypes.DEFAULT_TYPE)
     wb = Workbook()
     ws = wb.active
     ws.title = "Wallet report"
-    ws.append(["№", "Дата", "Тип", "Описание", "Сумма (AED)", "Баланс после операции (AED)"])
+    ws.append(
+        [
+            "№",
+            "Дата",
+            "Тип",
+            "Имя",
+            "Номер",
+            "Описание",
+            "Сумма (AED)",
+            "Баланс после операции (AED)",
+        ]
+    )
 
     running_balance = 0
     for index, row in enumerate(rows, start=1):
         running_balance += int(row["amount_cents"])
+        phone = extract_phone_from_description(row["description"])
+        name = users_by_phone.get(phone, "") if phone else ""
         ws.append(
             [
                 index,
                 row["created_at"],
                 row["type"],
+                name,
+                phone or "",
                 row["description"] or "",
                 float(cents_to_decimal(row["amount_cents"])),
                 float(cents_to_decimal(running_balance)),
